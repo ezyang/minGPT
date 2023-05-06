@@ -49,18 +49,29 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
-    def forward(self, x):
+    def forward(self, x, kvcache=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+
+        if kvcache is not None:
+            old_k, old_v = kvcache
+            k = torch.cat([old_k, k], dim=1)
+            v = torch.cat([old_v, v], dim=1)
+
+        current_cache = (k, v)
+
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        if kvcache is not None:
+            pass
+        else:
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -68,7 +79,7 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        return y, current_cache
 
 class Block(nn.Module):
     """ an unassuming Transformer block """
@@ -87,10 +98,11 @@ class Block(nn.Module):
         m = self.mlp
         self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x)))) # MLP forward
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, kvcache = None):
+        attn_out, kvcache_updated = self.attn(self.ln_1(x), kvcache=kvcache)
+        x = x + attn_out
         x = x + self.mlpf(self.ln_2(x))
-        return x
+        return x, kvcache_updated
 
 class GPT(nn.Module):
     """ GPT Language Model """
@@ -257,18 +269,27 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
         return optimizer
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, kvcache=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
 
+        if kvcache is None:
+            kvcache = [None] * self.block_size
+        else:
+            pos = pos[-1:]
+            idx = idx[-1:]
+
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
+
         x = self.transformer.drop(tok_emb + pos_emb)
+        new_kvcache = []
         for block in self.transformer.h:
-            x = block(x)
+            x, updated_cache = block(x)
+            new_kvcache.append(updated_cache)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
 
@@ -277,7 +298,7 @@ class GPT(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
-        return logits, loss
+        return logits, loss, new_kvcache
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k=None):
@@ -286,11 +307,12 @@ class GPT(nn.Module):
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        kvcache = None
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _, kvcache = self(idx_cond, kvcache=kvcache)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
